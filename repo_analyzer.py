@@ -1,7 +1,11 @@
 import os
 import sys
 import json
+import shutil
+import tempfile
+import subprocess
 from collections import Counter
+from urllib.parse import urlparse
 
 IGNORED_DIRS = {
     ".git",
@@ -78,6 +82,57 @@ def should_skip_dir(dirname: str) -> bool:
     return dirname in IGNORED_DIRS
 
 
+def is_github_url(value: str) -> bool:
+    if not value.startswith(("http://", "https://")):
+        return False
+
+    parsed = urlparse(value)
+    if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
+        return False
+
+    parts = [p for p in parsed.path.split("/") if p]
+    return len(parts) >= 2
+
+
+def normalize_github_url(url: str) -> str:
+    url = url.strip()
+    if url.endswith("/"):
+        url = url[:-1]
+    if not url.endswith(".git"):
+        url += ".git"
+    return url
+
+
+def clone_repo(url: str) -> str:
+    if shutil.which("git") is None:
+        raise RuntimeError("git is not installed or not found in PATH.")
+
+    temp_dir = tempfile.mkdtemp(prefix="repo_analyzer_")
+    repo_dir = os.path.join(temp_dir, "repo")
+
+    clone_cmd = [
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        normalize_github_url(url),
+        repo_dir,
+    ]
+
+    result = subprocess.run(
+        clone_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise RuntimeError(f"git clone failed: {result.stderr.strip() or result.stdout.strip()}")
+
+    return repo_dir
+
+
 def scan_repo(root: str):
     total_files = 0
     total_dirs = 0
@@ -108,7 +163,6 @@ def scan_repo(root: str):
             duplicate_names[name] += 1
 
             largest_files.append((size, path))
-
             check_possible_secret(path, possible_secrets)
 
     largest_files.sort(reverse=True, key=lambda x: x[0])
@@ -200,22 +254,36 @@ def print_report(report: dict):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python repo_analyzer.py <repo_path> [--json]")
+        print("Usage: python repo_analyzer.py <repo_path_or_github_url> [--json]")
         sys.exit(1)
 
-    root = sys.argv[1]
+    target = sys.argv[1]
     as_json = len(sys.argv) >= 3 and sys.argv[2] == "--json"
 
-    if not os.path.isdir(root):
-        print(f"Error: directory not found -> {root}")
+    temp_root_to_cleanup = None
+    root = target
+
+    try:
+        if is_github_url(target):
+            root = clone_repo(target)
+            temp_root_to_cleanup = os.path.dirname(root)
+        elif not os.path.isdir(root):
+            print(f"Error: directory not found -> {root}")
+            sys.exit(1)
+
+        report = scan_repo(root)
+
+        if as_json:
+            print(json.dumps(report, indent=2))
+        else:
+            print_report(report)
+
+    except Exception as e:
+        print(f"Error: {e}")
         sys.exit(1)
-
-    report = scan_repo(root)
-
-    if as_json:
-        print(json.dumps(report, indent=2))
-    else:
-        print_report(report)
+    finally:
+        if temp_root_to_cleanup:
+            shutil.rmtree(temp_root_to_cleanup, ignore_errors=True)
 
 
 if __name__ == "__main__":
